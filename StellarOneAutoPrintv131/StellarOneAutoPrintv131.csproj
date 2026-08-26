@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>StellarOneAutoPrintv131</RootNamespace>
+    <AssemblyName>StellarOneAutoPrintv131</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <FileVersion>25.201.0213</FileVersion>
+    <InformationalVersion>25.201.0213</InformationalVersion>
+    <Copyright>Copyright © 2005-2025 Acumatica, Inc. All rights reserved.</Copyright>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="PX.Common">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Common.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="PX.Common.Std">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Common.Std.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="PX.CS.Contracts">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.CS.Contracts.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="PX.Data">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Data.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- Not called directly - PXDatabase.SelectSingle's overload set includes
+         YaqlJoin-typed overloads (from this assembly), and the compiler needs
+         to resolve every candidate's signature during overload resolution
+         even when a different overload is the one actually picked. Without
+         this reference, RefreshShipmentTstamp's SelectSingle call in
+         StellarOneAutoPrint.cs fails with CS0012 regardless of which overload
+         it binds to. -->
+    <Reference Include="PX.DbServices">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.DbServices.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="PX.Data.BQL.Fluent">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Data.BQL.Fluent.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="PX.Objects">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Objects.DLL</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- Report/IReportRenderer (used by ReportPdfRenderGraph in
+         StellarOneAutoPrint_PrintJobLog.cs) are physically defined here, not in
+         PX.Data.dll - IReportLoaderService resolves via the PX.Data reference
+         above only because it's re-exported from there. -->
+    <Reference Include="PX.Reports">
+      <HintPath>..\..\..\Acumatica\AcumaticaERP1\Bin\PX.Reports.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Xml" />
+    <!-- Required for System.Web.Script.Serialization.JavaScriptSerializer used by
+         PrintNodeApiService. Not implicitly referenced by the SDK-style net48
+         project - without this the transport file fails to compile. -->
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+</Project>
