@@ -373,7 +373,7 @@ namespace StellarOneAutoPrint
             var request = CreateRequest($"{BaseUrl}/printers", "GET");
             string json = ExecuteAndReadBody(request, "PrintNode GET /printers");
 
-            var serializer = new JavaScriptSerializer();
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             var raw = serializer.Deserialize<List<Dictionary<string, object>>>(json);
 
             var result = new List<PrintNodePrinter>();
@@ -406,8 +406,15 @@ namespace StellarOneAutoPrint
         /// have been past Int32.MaxValue (2,147,483,647) for a while now.
         /// Confirmed on a real sandbox print: `int.Parse` on the returned ID
         /// threw "Value was either too large or too small for an Int32."
+        ///
+        /// rotate/fitToPage map to PrintNode's options.rotate/options.fit_to_page
+        /// (confirmed against PrintNode's API docs) - both apply to PDF content
+        /// only, no effect on raw/ZPL, so only passed through when contentType
+        /// is pdf_base64. See CarrierLabelPdfRotation's doc comment in
+        /// StellarOneAutoPrint_Setup.cs for why this exists.
         /// </summary>
-        public long SubmitPrintJob(int printerId, byte[] content, string title, string contentType = "pdf_base64")
+        public long SubmitPrintJob(int printerId, byte[] content, string title, string contentType = "pdf_base64",
+            int? rotate = null, bool? fitToPage = null)
         {
             var payload = new Dictionary<string, object>
             {
@@ -418,7 +425,24 @@ namespace StellarOneAutoPrint
                 { "source", "Acumatica - StellarOneAutoPrint" }
             };
 
-            var serializer = new JavaScriptSerializer();
+            if (contentType == "pdf_base64" && (rotate.HasValue && rotate.Value != 0 || fitToPage == true))
+            {
+                var options = new Dictionary<string, object>();
+                if (rotate.HasValue && rotate.Value != 0)
+                    options["rotate"] = rotate.Value;
+                if (fitToPage == true)
+                    options["fit_to_page"] = true;
+                payload["options"] = options;
+            }
+
+            // MaxJsonLength defaults to 2,097,152 chars (2MB) in .NET Framework -
+            // easily exceeded by a base64-encoded multi-page PDF (e.g. a
+            // combined label + commercial invoice + customs declaration on an
+            // international shipment), where Serialize() throws "the length of
+            // the string exceeds the value set on the maxJsonLength property"
+            // before any HTTP call is even attempted. Raised well above any
+            // realistic label/report size rather than left at the default.
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             string json = serializer.Serialize(payload);
             byte[] bodyBytes = Encoding.UTF8.GetBytes(json);
 

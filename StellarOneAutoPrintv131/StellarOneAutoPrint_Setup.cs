@@ -124,6 +124,42 @@ namespace StellarOneAutoPrint
         public virtual int? ConfirmPrinterID { get; set; }
         #endregion
 
+        #region CarrierLabelPdfRotation
+        public abstract class carrierLabelPdfRotation : BqlInt.Field<carrierLabelPdfRotation> { }
+
+        // PrintNode's /printjobs "options.rotate" - only takes effect for PDF
+        // content (pdf_base64/pdf_uri); PrintNode's own docs state printing
+        // options have no effect on RAW printing, so this only matters for
+        // Carrier Label attachments that turn out to be PDF (e.g. a customs
+        // form) rather than raw ZPL/EPL. Added 2026-09-13: a customs PDF
+        // attached alongside a ZPL carrier label printed at native scale on
+        // small label stock - tiny and misoriented, since nothing told
+        // PrintNode to rotate/fit it. Configurable here (not hardcoded)
+        // since the correct value depends on the physical printer/label
+        // stock and can only be confirmed by testing against it directly -
+        // international/customs shipments aren't reproducible in a sandbox
+        // EasyPost/FedEx account, so this needs to be tunable without a
+        // code change + republish per attempt.
+        [PXDBInt]
+        [PXDefault(0, PersistingCheck = PXPersistingCheck.Nothing)]
+        [PXIntList(new[] { 0, 90, 180, 270 }, new[] { "0 - No rotation", "90 - Rotate 90", "180 - Rotate 180", "270 - Rotate 270" })]
+        [PXUIField(DisplayName = "Carrier Label PDF Rotation")]
+        public virtual int? CarrierLabelPdfRotation { get; set; }
+        #endregion
+
+        #region CarrierLabelFitToPage
+        public abstract class carrierLabelFitToPage : BqlBool.Field<carrierLabelFitToPage> { }
+
+        // PrintNode's /printjobs "options.fit_to_page" - scales PDF content to
+        // fill the printer's configured page/label size instead of printing
+        // at native scale. Same PDF-only caveat and rationale as
+        // CarrierLabelPdfRotation above.
+        [PXDBBool]
+        [PXDefault(false, PersistingCheck = PXPersistingCheck.Nothing)]
+        [PXUIField(DisplayName = "Fit Carrier Label PDF to Page")]
+        public virtual bool? CarrierLabelFitToPage { get; set; }
+        #endregion
+
         #region tstamp
         public abstract class tstamp : BqlByteArray.Field<tstamp> { }
 
@@ -179,7 +215,6 @@ namespace StellarOneAutoPrint
         // Read-only reference grid, if you choose to place it - shows the
         // last-synced PrintNode printer list without a live API call.
         public PXSelect<SOStellarPrintNodePrinter> PrintNodePrinters;
-
         public PXAction<SOStellarPrintNodeSetup> TestPrintNodeConnection;
         [PXUIField(DisplayName = "Test PrintNode Connection")]
         [PXButton]

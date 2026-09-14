@@ -17,6 +17,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using PX.Data;
 using PX.Data.BQL;
@@ -288,7 +289,7 @@ namespace StellarOneAutoPrint
             if (!printerId.HasValue)
                 throw new PXException("Select a printer to reprint to.");
 
-            var setup = SelectFrom<SOStellarPrintNodeSetup>.View.Select(this).TopFirst;
+            var setup = SelectFrom<SOStellarPrintNodeSetup>.View.SelectSingleBound(this, null).TopFirst;
             if (string.IsNullOrEmpty(setup?.PrintNodeApiKey))
                 throw new PXException("PrintNode API key is not configured on the StellarOne PrintNode Setup screen.");
 
@@ -486,6 +487,16 @@ namespace StellarOneAutoPrint
         /// traced instead. Failing to attach documentBytes is likewise
         /// non-fatal to the log row itself, traced separately.
         /// </summary>
+        // TESTED 2026-09-13, RULED OUT: temporarily skipped this method's
+        // nested logGraph.Save.Press() entirely (shipment 006679, clean run,
+        // no debugger pause) to test whether it was leaving the connection
+        // in a state that collided with the very next select. It was not -
+        // the exact same "There is already an open DataReader" collision
+        // still occurred at the same point (TryPrintConfirmation's
+        // AlreadySucceeded check) even with this method's DB activity fully
+        // removed from the call chain. Do not re-attempt this fix without
+        // new evidence pointing back at this method specifically.
+
         public static void Write(
             PXGraph graph, string shipmentNbr, int? packageLineNbr, string jobType, string description,
             int? printerId, string status, string errorMessage, long? printNodeJobId, int? sourceLogId = null,
@@ -538,6 +549,71 @@ namespace StellarOneAutoPrint
             catch (Exception ex)
             {
                 PXTrace.WriteError("PrintJobLogger: failed to write log row for {0}: {1}", shipmentNbr, ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Durable secondary guard against duplicate PrintNode submissions, on
+        /// top of (not instead of) the SOShipmentExt printed-flag checks in
+        /// StellarOneAutoPrint.cs. The flag write (SetPrintedFlag, a raw
+        /// PXDatabase.Update against the SAME SOShipment row Confirm
+        /// Shipment's own still-open transaction holds) can itself fail after
+        /// a print has already genuinely succeeded - confirmed in production
+        /// 2026-08-25/26, where the same carrier label for one shipment/
+        /// package picked up 4 different PrintNode job IDs across retries,
+        /// because each retry's flag write failed right after a real,
+        /// already-logged SUCCESS row, so UsrLabelPrinted never actually
+        /// became true and the next attempt printed it again.
+        ///
+        /// This log write (PrintJobLogger.Write, above) is the one part of
+        /// this whole flow that has reliably succeeded every time in that
+        /// incident - so checking it before printing again is a materially
+        /// safer idempotency signal than the flag alone. Fails OPEN (returns
+        /// false, i.e. "go ahead and print") on any error, since the failure
+        /// mode of skipping a print that should have happened is worse than
+        /// the pre-existing duplicate-risk this is trying to reduce.
+        ///
+        /// Filters by shipment/job type/status in the WHERE clause and
+        /// compares packageLineNbr in memory rather than in BQL - both sides
+        /// are Nullable&lt;int&gt; here, and comparing that in BQL would need
+        /// an IsNull branch for GiftNote/Confirmation's always-null package
+        /// line vs an IsEqual branch for CarrierLabel's real one; per-shipment
+        /// row counts for this table are small enough that filtering the
+        /// (already-narrowed) result in C# is simpler and just as cheap.
+        /// </summary>
+        public static bool AlreadySucceeded(PXGraph graph, string shipmentNbr, string jobType, int? packageLineNbr)
+        {
+            try
+            {
+                // ToList() before the foreach, not iterated lazily - this is
+                // called repeatedly through a single Confirm Shipment (once
+                // per job type, once per package for CarrierLabel), and the
+                // old code returned from inside the foreach the moment it
+                // found a match, without ever finishing enumeration if a
+                // match wasn't the first row. Kept as defensive practice;
+                // it was one of several suspects chased for the "There is
+                // already an open DataReader" collisions during Confirm
+                // Shipment, but the actual, confirmed cause was unrelated -
+                // an undisposed PXDataRecord in RefreshShipmentTstamp
+                // (StellarOneAutoPrint.cs), fixed 2026-09-13.
+                var rows = SelectFrom<SOStellarPrintJobLog>
+                    .Where<SOStellarPrintJobLog.shipmentNbr.IsEqual<@P.AsString>
+                        .And<SOStellarPrintJobLog.jobType.IsEqual<@P.AsString>>
+                        .And<SOStellarPrintJobLog.status.IsEqual<@P.AsString>>>
+                    .View.Select(graph, shipmentNbr, jobType, PrintJobLogStatus.Success)
+                    .RowCast<SOStellarPrintJobLog>()
+                    .ToList();
+
+                foreach (SOStellarPrintJobLog row in rows)
+                {
+                    if (row.PackageLineNbr == packageLineNbr) return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                PXTrace.WriteWarning("PrintJobLogger: AlreadySucceeded check failed for {0}/{1}: {2}", shipmentNbr, jobType, ex.Message);
+                return false;
             }
         }
     }

@@ -23,11 +23,17 @@
 // on purpose - that one is print DISPATCH, this one is user PREFERENCES, different
 // concerns, matching this project's one-file-per-concern convention.
 //
-// You still need to: add a px:PXSmartPanel to SO302000's customization layer via
-// the Screen Editor, bound to the MyPrinterPrefs view, with the toolbar button for
-// OpenMyPrinterPrefs wired to open it via its PopupPanel property. Same kind of
-// manual screen-editor follow-up StellarOneAutoPrint_Setup.cs already calls out
-// for the admin screen's creation.
+// Modern UI wiring lives entirely in SO302000_StellarOneMyPrinterPrefs.ts/.html
+// (FrontendSources\screen\src\development\screens\SO\SO302000\extensions) - a
+// plain qp-panel + a purely client-side qp-button (config.bind popupPanel, no
+// PXActionState/server action). Confirmed 2026-09-14 by reading client-controls'
+// actual qp-button.js: a button bound to a real PXActionState via state.bind can
+// never also open a config.bind popupPanel - its click handler returns as soon
+// as an action/commandName is present, before ever checking popupPanel. The
+// provisioning that used to run in this button's own action handler
+// (EnsureAllJobTypesProvisioned) now runs from MyPrinterPrefs' own view
+// delegate below instead, so it fires whenever the panel's grid loads data
+// regardless of how the popup was opened.
 //
 // IMPORTANT: this cache is shared with the whole SOShipmentEntry graph, since
 // it's a view on a PXGraphExtension<SOShipmentEntry>, not its own standalone
@@ -79,13 +85,44 @@ namespace StellarOneAutoPrint
         [PXUIField(DisplayName = "User", Visible = false)]
         protected virtual void _(Events.CacheAttached<SOStellarPrintNodeUserMap.userID> e) { }
 
-        public PXAction<SOShipment> OpenMyPrinterPrefs;
-        [PXUIField(DisplayName = "My Printer Preferences")]
-        [PXButton]
-        protected virtual IEnumerable openMyPrinterPrefs(PXAdapter adapter)
+        // View delegate (Acumatica recognizes a method named exactly like the
+        // DataView field as its custom Select), not a PXAction/RowSelecting on
+        // SOStellarPrintNodeUserMap generally - this must only run when THIS
+        // specific view is queried, not on every SOStellarPrintNodeUserMap
+        // lookup in the graph (RunPrintNode's IsUserMigratedToPrintNode/
+        // ResolvePrintNodePrinter also query that DAC, on every shipment
+        // confirm - a DAC-level RowSelecting would have fired there too and
+        // provisioned rows for the confirming user on every single confirm,
+        // not just when they actually open this panel).
+        //
+        // Previously wired to a PXAction ("OpenMyPrinterPrefs") triggered by
+        // the Modern UI button's own server action - removed 2026-09-14 after
+        // confirming, by reading client-controls' actual qp-button.js, that a
+        // qp-button bound to a real PXActionState can never also open a
+        // config.bind popupPanel: its click handler returns as soon as
+        // this.config.action is set (which state.bind always populates from
+        // the action's commandName), before ever checking popupPanel. Moving
+        // the provisioning here instead makes it run automatically whenever
+        // the panel's grid loads its data, regardless of how the popup was
+        // opened - the Modern UI button is now a plain client-side
+        // config.bind="{popupPanel: 'MyPrinterPrefs'}" trigger with no server
+        // action at all (see SO302000_StellarOneMyPrinterPrefs.ts/.html).
+        protected virtual IEnumerable myPrinterPrefs()
         {
             EnsureAllJobTypesProvisioned();
-            return adapter.Get();
+
+            // NOT MyPrinterPrefs.Select()/View.Select() here - Acumatica
+            // dispatches those through this very delegate (matched by name),
+            // so calling either back out from inside it is infinite
+            // self-recursion, not "the base select". Confirmed live:
+            // "Insufficient stack to continue executing the program safely."
+            // A fresh, unrelated SelectFrom query (same pattern already used
+            // by IsUserMigratedToPrintNode/ResolvePrintNodePrinter in
+            // StellarOneAutoPrint.cs) returns the same rows without routing
+            // back through MyPrinterPrefs' own dispatch at all.
+            return SelectFrom<SOStellarPrintNodeUserMap>
+                .Where<SOStellarPrintNodeUserMap.userID.IsEqual<@P.AsGuid>>
+                .View.Select(Base, Base.Accessinfo.UserID);
         }
 
         /// <summary>

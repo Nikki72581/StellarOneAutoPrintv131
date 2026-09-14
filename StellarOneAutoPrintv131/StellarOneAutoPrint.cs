@@ -43,24 +43,43 @@
 // and live in the PrintNode branch, now also covers the DeviceHub branch
 // since both live in the same handler.)
 //
-// That handler's body runs inside a PXConnectionScope + PXCommandScope (see
-// the RowPersisted handler below) - Confirm Shipment drives it through
-// PXProcessing<T>.ProcessRecords, which keeps an open reader on the graph's
-// ambient connection for the whole batch, and every DB call this handler
-// makes (directly or via RunPrintNode/RunDeviceHub/PrintJobLogger) would
-// otherwise collide with that reader and throw "There is already an open
-// DataReader associated with this Connection which must be closed first,"
-// aborting the Confirm entirely. Isolating onto a separate connection fixes
-// that, but that connection then has to wait out the locks ConfirmShipment's
-// own (still-open) transaction holds on this shipment - PXCommandScope gives
-// it enough time to do that instead of hitting the default 30s timeout.
+// All DB access in this handler runs on the plain ambient connection -
+// deliberately no PXConnectionScope/PXCommandScope anywhere below. An earlier
+// revision wrapped most of the raw BQL/PXDatabase calls here in an isolated
+// second connection with a 300s command timeout, reasoning that
+// PXProcessing<T>.ProcessRecords (which drives Confirm Shipment) keeps an
+// open reader on the ambient connection for the whole batch and would
+// otherwise collide with these calls. In production that isolation was the
+// actual cause of a regression, not a fix for one: this handler runs
+// SYNCHRONOUSLY, on the SAME thread as ConfirmShipment's still-open outer
+// transaction. A query issued on a genuinely separate connection/session
+// then has to wait for locks that transaction holds on this shipment's rows
+// - locks that can only be released after THIS call returns. That's a
+// self-deadlock, not a transient wait, and no timeout value fixes it, it only
+// changes how long the eventual failure takes to surface. This was confirmed
+// directly against SOStellarPrintJobLog: with the isolated connection +
+// 300s command timeout, Gift Note/Carrier Label/Confirmation jobs for the
+// same shipment failed in sequence with "Execution Timeout Expired" at gaps
+// of ~300 and ~302 seconds - i.e. each one blocked for exactly the configured
+// timeout before giving up, back to back, turning a single Confirm Shipment
+// click into a 10+ minute hang that still ended in the same failures. Staying
+// on the ambient connection avoids the self-deadlock entirely, because a SQL
+// session never blocks on locks it already holds itself - which is exactly
+// how this handler worked in the original, proven-working version this
+// project was rebuilt from (no connection isolation anywhere in it either).
+// The "open reader" collision the isolation was meant to prevent turned out
+// to be real, but unrelated to ProcessRecords or connection isolation
+// entirely: root-caused 2026-09-13 to an undisposed PXDataRecord returned
+// by PXDatabase.SelectSingle in RefreshShipmentTstamp (see that method's
+// comment for the full mechanism and fix). Re-adding connection isolation
+// here would reintroduce the self-deadlock regression above for no benefit.
 //
 // Two separate hooks on SOShipment, for two different reasons:
 //   - RowPersisting resets the printed-flags when the shipment gets
 //     un-confirmed (Correct Shipment). Plain SetValueExt, no raw SQL - this
 //     fires before the row's UPDATE is generated, so the reset rides along
 //     in that same UPDATE with tstamp handled natively.
-//   - RowPersisted(Completed) fires the actual printing once a successful
+//   - RowPersisted(Completed) runs the actual printing once a successful
 //     confirm is durable (see above). Because that row's UPDATE has
 //     already executed by this point, marking the printed-flags requires a
 //     second, raw write (SetPrintedFlag) - which takes care to leave the
@@ -68,6 +87,34 @@
 //     same session (e.g. a Correct Shipment click right after). See
 //     SetPrintedFlag's doc comment for the "record has been changed by
 //     another process" bug this fixed.
+//
+// RowPersisted runs the print dispatch inline (a PXLongOperation-deferral
+// detour was tried and reverted - see RowPersisted's own comment for why),
+// but wraps the whole thing in a try/catch that never rethrows. That
+// try/catch is load-bearing, not defensive boilerplate: RowPersisted fires
+// synchronously inside Confirm Shipment's OWN Save.Press() call (confirmed
+// by decompiling PX.Objects.DLL - ConfirmShipmentExtension.ConfirmShipment()
+// calls base.Base.Save.Press() at its very end, which is what runs this
+// handler), so an unhandled exception here doesn't just fail our printing -
+// it propagates up and fails the WHOLE confirm. Confirmed live in
+// production: a plain BQL select elsewhere in this call chain threw "There
+// is already an open DataReader associated with this Connection which must
+// be closed first" (root-caused and fixed 2026-09-13 - see
+// RefreshShipmentTstamp's comment), and because that particular call wasn't
+// inside any of the
+// individual TryPrint*'s own try/catch, it escaped all the way up through
+// Save.Press() and left the shipment stuck un-confirmed even though
+// ShipPackages had already generated and saved the carrier label
+// successfully. Printing must never be able to do that - it's a side effect
+// of a successful confirm, not a precondition for one. (A separate,
+// unrelated EasyPost/UPS carrier error was chased earlier and briefly
+// blamed on this handler running inline; that was a dead end - decompiling
+// ConfirmShipmentAction showed ShipPackages, the carrier call, runs BEFORE
+// Save.Press() and therefore fully before this handler can ever fire, and
+// unpublishing this Customization Project entirely reproduced the identical
+// carrier error with zero of our code active. See RowPersisted's own
+// comment and project memory for the full history if this needs
+// re-deriving.)
 //
 // Components:
 //   SOShipmentExt               - 3 "already printed" guard flags on Shipment,
@@ -81,6 +128,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using PX.Data;
 using PX.Data.BQL;
@@ -144,91 +192,84 @@ namespace StellarOneAutoPrint
 
             Guid? currentUserID = Base.Accessinfo?.UserID;
 
-            // Confirm Shipment drives this handler through PXProcessing<T>.ProcessRecords
-            // (true even for a single shipment - the Confirm Shipment action is mass-process
-            // infrastructure regardless of how many rows are selected), which keeps an open
-            // reader on the graph's ambient connection for the duration of the whole batch,
-            // and TranStatus.Completed does NOT mean this shipment's outer transaction has
-            // committed - ConfirmShipment(args) keeps going after that (invoicing, external
-            // carrier calls, etc.) inside the same PXTransactionScope, still holding locks on
-            // this shipment's rows. Every raw BQL/PXDatabase call this handler makes - printer
-            // lookups, SetPrintedFlag/RefreshShipmentTstamp, PrintJobLogger's insert - runs
-            // WithIsolatedConnection (below) for exactly that reason: an independent connection
-            // (PXConnectionScope) so it can't collide with ProcessRecords' open reader, and a
-            // generous command timeout (PXCommandScope) so it can wait out those locks instead
-            // of hitting the default 30s timeout.
+            // NOTE: an earlier revision wrapped this call in
+            // PXLongOperation.StartOperation on a throwaway graph, aiming to
+            // move our PrintNode HTTP calls off the thread Confirm Shipment's
+            // own carrier-service call runs on. That turned out to be a
+            // no-op, confirmed by decompiling PX.Data.dll: RowPersisted fires
+            // from inside ConfirmShipmentAction's own
+            // PXLongOperation.StartOperation(this, ...) call, and
+            // RuntimeLongOperationManager.StartOperationImpl detects the
+            // ambient long-operation context regardless of which graph/key
+            // you pass it and runs the delegate via RunSync - i.e. inline,
+            // synchronously, right here, same as calling it directly. (The
+            // EasyPost/UPS carrier error that motivated that change turned
+            // out to be unrelated to this project entirely: decompiling
+            // ConfirmShipmentAction showed it calls ShipPackages - the
+            // carrier call - BEFORE ConfirmShipment/Save.Press, i.e. fully
+            // before RowPersisted can ever fire; independently confirmed
+            // live by unpublishing this Customization Project entirely and
+            // reproducing the exact same carrier error with zero of our code
+            // active.) Removed rather than left in place, since it added a
+            // full extra PXGraph.CreateInstance<SOShipmentEntry>() on every
+            // single confirm for no actual benefit.
             //
-            // Deliberately NOT wrapped here at the top level, and NOT wrapped in the full
-            // WithIsolatedConnection (second physical connection) around the report rendering
-            // or PrintNode/DeviceHub submission calls specifically: report rendering
-            // (RenderReportToPdfBytes) issues its own internal queries, and swapping THOSE onto
-            // a second connection caused a second incident - report rendering that used to
-            // complete normally started hanging for 10+ minutes per document, unresponsive even
-            // to Acumatica's own Thread.Abort watchdog. Report rendering instead runs under
-            // WithExtendedTimeout (PXCommandScope only, no PXConnectionScope - see its doc
-            // comment) so its queries stay on the ambient connection but get the same generous
-            // timeout to wait out the lock. WithIsolatedConnection itself is applied narrowly,
-            // only around the specific raw DB calls that actually had the reader/lock problem in
-            // the first place - see each call site below.
-            if (IsUserMigratedToPrintNode(currentUserID))
-                RunPrintNode(shipment, currentUserID);
-            else
-                RunDeviceHub(shipment, currentUserID);
-        }
-
-        /// <summary>
-        /// Runs a raw BQL/PXDatabase operation on an independent connection with a generous
-        /// command timeout, so it can't collide with whatever open reader/lock Confirm Shipment's
-        /// own still-in-progress transaction holds on this shipment's rows - see the RowPersisted
-        /// handler's comment for the full story. Deliberately narrow: apply this ONLY to simple,
-        /// known-fast raw calls (a SelectSingleBound, a PXDatabase.Update, PrintJobLogger's plain
-        /// DAC insert) - never around report rendering or the PrintNode/DeviceHub submission
-        /// calls, which aren't vulnerable to the original problem and, it turns out, behave badly
-        /// under an extended timeout for unrelated reasons of their own.
-        /// </summary>
-        private static T WithIsolatedConnection<T>(Func<T> query)
-        {
-            using (new PXConnectionScope())
-            using (new PXCommandScope(300))
+            // try/catch here is not optional: this fires synchronously
+            // inside Confirm Shipment's own Save.Press() call (see
+            // ConfirmShipmentAction, decompiled from PX.Objects.DLL - it
+            // calls base.Base.Save.Press() at the very end of
+            // ConfirmShipment(), which is what runs RowPersisted). Printing
+            // is a side effect that must never be able to block or fail the
+            // confirm itself - confirmed live in production: an unhandled
+            // "There is already an open DataReader..." thrown from a plain
+            // BQL select in this call chain (outside any of the individual
+            // TryPrint*'s own try/catch - e.g. LoadSetup,
+            // IsUserMigratedToPrintNode, ResolvePrintNodePrinter) propagated
+            // all the way up through Save.Press() and left the shipment
+            // stuck un-confirmed even though ShipPackages had already
+            // generated and saved the carrier label successfully. Every
+            // individual TryPrint* method already catches its own errors and
+            // logs them to SOStellarPrintJobLog; this outer catch is the
+            // backstop for everything AROUND those calls (setup/printer
+            // lookups, the migration check) that isn't covered by an inner
+            // try/catch of its own.
+            // Retries the whole dispatch (not just one query) up to 3 times
+            // on "already an open DataReader" specifically. Root-caused and
+            // fixed 2026-09-13 (an undisposed PXDataRecord in
+            // RefreshShipmentTstamp, leaking an open reader on the ambient
+            // connection on every successful print - see that method's
+            // comment) - this collision is not expected to recur, so this
+            // retry is now a defensive backstop rather than a workaround for
+            // a live issue. Left in place since it's cheap and safe: the
+            // entire dispatch is idempotent end to end (every job type is
+            // guarded by both its own printed-flag AND
+            // PrintJobLogger.AlreadySucceeded), so re-running from the top
+            // after a partial failure just skips whatever already went out
+            // and picks up wherever it left off - it can't cause a duplicate
+            // print.
+            const int maxAttempts = 3;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                return query();
-            }
-        }
-
-        private static void WithIsolatedConnection(Action action)
-        {
-            using (new PXConnectionScope())
-            using (new PXCommandScope(300))
-            {
-                action();
-            }
-        }
-
-        /// <summary>
-        /// PXCommandScope(300) alone - NOT paired with PXConnectionScope. Decompiling
-        /// PX.Data confirms these two scopes are fully independent: PXCommandScope only
-        /// stores a timeout override that PXDatabase.CreateCommand() applies to whatever
-        /// connection is already ambient; it does not touch connection selection at all
-        /// (that's PXConnectionScope's job, via PXConnectionScope.GetConnection()).
-        ///
-        /// Report rendering (RenderReportToPdfBytes, for Gift Note/Confirmation) has to
-        /// stay on the ambient connection - wrapping it in a full WithIsolatedConnection
-        /// (i.e. also swapping to a second physical connection) previously made rendering
-        /// hang for 10+ minutes per document, unresponsive even to Acumatica's own
-        /// Thread.Abort watchdog (see the RowPersisted handler's comment). But left fully
-        /// unwrapped, the report's own internal data-source queries run with the SqlClient
-        /// default 30s command timeout and were observed failing in production with
-        /// "Execution Timeout Expired" while blocked behind Confirm Shipment's still-open
-        /// outer transaction (SOStellarPrintJobLog, 2026-08-25, shipments 006653+ - same
-        /// underlying lock-wait this whole isolation pattern exists to route around).
-        /// This gives the ambient connection's commands the same generous 300s timeout to
-        /// wait out those locks, without opening the second connection that caused the hang.
-        /// </summary>
-        private static T WithExtendedTimeout<T>(Func<T> query)
-        {
-            using (new PXCommandScope(300))
-            {
-                return query();
+                try
+                {
+                    if (IsUserMigratedToPrintNode(currentUserID))
+                        RunPrintNode(shipment, currentUserID);
+                    else
+                        RunDeviceHub(shipment, currentUserID);
+                    break;
+                }
+                catch (InvalidOperationException ex) when (attempt < maxAttempts
+                    && ex.Message.IndexOf("open DataReader", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    PXTrace.WriteWarning("AutoPrint: open-reader collision for {0}, retrying (attempt {1}/{2}).",
+                        shipment.ShipmentNbr, attempt, maxAttempts);
+                    System.Threading.Thread.Sleep(75 * attempt);
+                }
+                catch (Exception ex)
+                {
+                    PXTrace.WriteError("AutoPrint: unhandled failure for {0}, printing skipped: {1}", shipment.ShipmentNbr, ex.Message);
+                    break;
+                }
             }
         }
 
@@ -271,46 +312,40 @@ namespace StellarOneAutoPrint
             if (shipExt?.UsrGiftNotePrinted == true) return null;
             if (string.IsNullOrWhiteSpace(setup.GiftNoteReportID)) return null;
             if (!HasGiftNoteFlag(shipment)) return null;
+            // Secondary guard on top of the flag above - see AlreadySucceeded's
+            // doc comment for why the flag alone isn't sufficient here.
+            if (PrintJobLogger.AlreadySucceeded(Base, shipment.ShipmentNbr, PrintJobTypes.GiftNote, null)) return null;
 
-            int? printerId = WithIsolatedConnection(() => ResolvePrintNodePrinter(userID, PrintJobTypes.GiftNote))
-                             ?? setup.GiftNotePrinterID;
+            int? printerId = ResolvePrintNodePrinter(userID, PrintJobTypes.GiftNote) ?? setup.GiftNotePrinterID;
             string description = "Gift Note - " + shipment.ShipmentNbr;
 
             if (!printerId.HasValue)
             {
                 string msg = "No PrintNode printer configured for Gift Note.";
                 PXTrace.WriteWarning("AutoPrint: {0} ({1})", msg, shipment.ShipmentNbr);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
-                    null, PrintJobLogStatus.Error, msg, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
+                    null, PrintJobLogStatus.Error, msg, null);
                 return msg;
             }
 
             try
             {
-                // Stays on the ambient connection (not WithIsolatedConnection) - see
-                // WithExtendedTimeout's doc comment for why - but still needs a longer
-                // command timeout than the 30s default to wait out Confirm Shipment's
-                // still-open outer transaction, same as the raw DB calls above and below.
-                byte[] pdfBytes = WithExtendedTimeout(() =>
-                    PrintNodeDocumentRenderer.RenderReportToPdfBytes(setup.GiftNoteReportID, baseParams, description));
+                byte[] pdfBytes = PrintNodeDocumentRenderer.RenderReportToPdfBytes(setup.GiftNoteReportID, baseParams, description);
 
                 long jobId = new PrintNodeApiService(setup.PrintNodeApiKey)
                     .SubmitPrintJob(printerId.Value, pdfBytes, description);
 
-                WithIsolatedConnection(() =>
-                {
-                    MarkPrinted<SOShipmentExt.usrGiftNotePrinted>(shipment);
-                    PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
-                        printerId, PrintJobLogStatus.Success, null, jobId,
-                        documentBytes: pdfBytes, documentFileName: description + ".pdf");
-                });
+                MarkPrinted<SOShipmentExt.usrGiftNotePrinted>(shipment);
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
+                    printerId, PrintJobLogStatus.Success, null, jobId,
+                    documentBytes: pdfBytes, documentFileName: description + ".pdf");
                 return null;
             }
             catch (Exception ex)
             {
                 PXTrace.WriteError("AutoPrint: Gift Note FAILED for {0}: {1}", shipment.ShipmentNbr, ex.Message);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
-                    printerId, PrintJobLogStatus.Error, ex.Message, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.GiftNote, description,
+                    printerId, PrintJobLogStatus.Error, ex.Message, null);
                 return "Gift Note printing failed: " + ex.Message;
             }
         }
@@ -326,15 +361,14 @@ namespace StellarOneAutoPrint
         {
             if (shipExt?.UsrLabelPrinted == true) return null;
 
-            int? printerId = WithIsolatedConnection(() => ResolvePrintNodePrinter(userID, PrintJobTypes.CarrierLabel))
-                             ?? setup.LabelPrinterID;
+            int? printerId = ResolvePrintNodePrinter(userID, PrintJobTypes.CarrierLabel) ?? setup.LabelPrinterID;
 
             if (!printerId.HasValue)
             {
                 string msg = "No PrintNode label printer configured.";
                 PXTrace.WriteWarning("AutoPrint: {0} (shipment {1})", msg, shipment.ShipmentNbr);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.CarrierLabel,
-                    "Carrier Label - " + shipment.ShipmentNbr, null, PrintJobLogStatus.Error, msg, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.CarrierLabel,
+                    "Carrier Label - " + shipment.ShipmentNbr, null, PrintJobLogStatus.Error, msg, null);
                 return msg;
             }
 
@@ -343,84 +377,90 @@ namespace StellarOneAutoPrint
 
             try
             {
-                var packages = WithIsolatedConnection(() => SelectFrom<SOPackageDetailEx>
+                // Materialized with ToList() before the loop starts, not
+                // iterated lazily, since the loop body issues its own nested
+                // queries per package on this same ambient connection (no
+                // MultipleActiveResultSets). Defensive practice, not a fix
+                // for a specific incident - the "There is already an open
+                // DataReader" collisions once suspected here turned out to
+                // have an unrelated, confirmed cause: an undisposed
+                // PXDataRecord in RefreshShipmentTstamp, fixed 2026-09-13.
+                var packages = SelectFrom<SOPackageDetailEx>
                     .Where<SOPackageDetailEx.shipmentNbr.IsEqual<@P.AsString>>
-                    .View.Select(Base, shipment.ShipmentNbr));
+                    .View.Select(Base, shipment.ShipmentNbr)
+                    .RowCast<SOPackageDetailEx>()
+                    .ToList();
 
                 foreach (SOPackageDetailEx pkg in packages)
                 {
                     if (pkg.NoteID == null) continue;
+                    // Secondary guard, per package - see AlreadySucceeded's doc
+                    // comment for why the shipment-level flag alone isn't
+                    // sufficient here (this is the exact case that produced 4
+                    // duplicate PrintNode job IDs for one label in production).
+                    if (PrintJobLogger.AlreadySucceeded(Base, shipment.ShipmentNbr, PrintJobTypes.CarrierLabel, pkg.LineNbr)) continue;
+
+                    Guid[] fileIDs = PXNoteAttribute.GetFileNotes(Base.Packages.Cache, pkg);
+                    if (fileIDs == null || fileIDs.Length == 0) continue;
 
                     UploadFileMaintenance uploader = PXGraph.CreateInstance<UploadFileMaintenance>();
-                    Guid[] fileIDs = null;
-                    Guid? latestFileID = null;
-                    PX.SM.FileInfo labelFile = null;
 
-                    // File lookups are raw DB reads - isolate them, same reason as everything
-                    // else in this handler. Rendering/submission below stays unwrapped.
-                    // GetFileNotes (PXNoteAttribute -> NoteDoc.SelectMulti) is a BQL query too -
-                    // it has to be inside this isolated scope along with the GetFile lookups
-                    // below, not run ambient before it. Left ambient, it was the actual cause of
-                    // the "Execution Timeout Expired" errors hitting Carrier Label jobs in
-                    // production: it collided with the same still-open outer transaction this
-                    // whole isolation pattern exists to route around. See
-                    // SOStellarPrintJobLog history from 2026-08-25 (shipments 006653+).
-                    WithIsolatedConnection(() =>
+                    // Send EVERY attachment matching "Label"*, not just the last
+                    // one in attachment order. A package can legitimately carry
+                    // more than one - confirmed live 2026-09-13 on an
+                    // international shipment, where the carrier integration
+                    // attached both the raw ZPL carrier label AND a separate
+                    // customs/commercial-invoice PDF, both named with a "Label"
+                    // prefix ("Label #....zpl" and "Label #...-#1 Customs.pdf").
+                    // Keeping only the last match silently dropped the actual
+                    // shipping label and sent only the customs PDF - logged as
+                    // one clean SUCCESS row, so nothing looked wrong in
+                    // SOStellarPrintJobLog even though the real label never
+                    // printed and had to be done manually.
+                    foreach (Guid fileID in fileIDs)
                     {
-                        fileIDs = PXNoteAttribute.GetFileNotes(Base.Packages.Cache, pkg);
-                        if (fileIDs == null || fileIDs.Length == 0) return;
+                        PX.SM.FileInfo fileInfo = uploader.GetFile(fileID);
+                        if (fileInfo == null) continue;
 
-                        foreach (Guid fileID in fileIDs)
+                        string fileName = fileInfo.Name ?? string.Empty;
+                        if (!fileName.StartsWith("Label", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        if (fileInfo.BinData == null || fileInfo.BinData.Length == 0)
                         {
-                            PX.SM.FileInfo fileInfo = uploader.GetFile(fileID);
-                            if (fileInfo == null) continue;
-
-                            string fileName = fileInfo.Name ?? string.Empty;
-                            if (!fileName.StartsWith("Label", StringComparison.OrdinalIgnoreCase)) continue;
-
-                            latestFileID = fileID; // last match in attachment order = newest
+                            PXTrace.WriteWarning("AutoPrint: Label file {0} had no data for shipment {1} pkg {2}.",
+                                fileName, shipment.ShipmentNbr, pkg.LineNbr);
+                            continue;
                         }
 
-                        if (latestFileID.HasValue)
-                            labelFile = uploader.GetFile(latestFileID.Value);
-                    });
+                        // Label format is carrier-dependent and can vary file to
+                        // file within the same package (e.g. a raw ZPL label
+                        // alongside a rendered PDF customs form), so the content
+                        // type has to be detected per file rather than assumed
+                        // for the whole shipment.
+                        string contentType = PrintNodeDocumentRenderer.DetectPrintNodeContentType(fileInfo.BinData);
+                        string description = string.Format("Carrier Label - {0} pkg {1} ({2})", shipment.ShipmentNbr, pkg.LineNbr, fileName);
+                        PXTrace.WriteInformation("AutoPrint: Label file {0} for {1} pkg {2} detected as {3}.",
+                            fileName, shipment.ShipmentNbr, pkg.LineNbr, contentType);
+                        long jobId = service.SubmitPrintJob(printerId.Value, fileInfo.BinData, description, contentType,
+                            setup.CarrierLabelPdfRotation, setup.CarrierLabelFitToPage);
 
-                    if (!latestFileID.HasValue) continue;
+                        PrintJobLogger.Write(Base, shipment.ShipmentNbr, pkg.LineNbr, PrintJobTypes.CarrierLabel, description,
+                            printerId, PrintJobLogStatus.Success, null, jobId);
 
-                    if (labelFile?.BinData == null || labelFile.BinData.Length == 0)
-                    {
-                        PXTrace.WriteWarning("AutoPrint: Label file {0} had no data for shipment {1} pkg {2}.",
-                            latestFileID, shipment.ShipmentNbr, pkg.LineNbr);
-                        continue;
+                        anyPrinted = true;
                     }
-
-                    // Label format is carrier-dependent and can vary package to
-                    // package within the same shipment (e.g. UPS returning ZPL
-                    // for one package, FedEx returning PDF for another), so the
-                    // content type has to be detected per file rather than
-                    // assumed for the whole shipment.
-                    string contentType = PrintNodeDocumentRenderer.DetectPrintNodeContentType(labelFile.BinData);
-                    string description = string.Format("Carrier Label - {0} pkg {1}", shipment.ShipmentNbr, pkg.LineNbr);
-                    PXTrace.WriteInformation("AutoPrint: Label for {0} pkg {1} detected as {2}.",
-                        shipment.ShipmentNbr, pkg.LineNbr, contentType);
-                    long jobId = service.SubmitPrintJob(printerId.Value, labelFile.BinData, description, contentType);
-
-                    WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, pkg.LineNbr, PrintJobTypes.CarrierLabel, description,
-                        printerId, PrintJobLogStatus.Success, null, jobId));
-
-                    anyPrinted = true;
                 }
 
                 if (anyPrinted)
-                    WithIsolatedConnection(() => MarkPrinted<SOShipmentExt.usrLabelPrinted>(shipment));
+                    MarkPrinted<SOShipmentExt.usrLabelPrinted>(shipment);
 
                 return null;
             }
             catch (Exception ex)
             {
                 PXTrace.WriteError("AutoPrint: Label FAILED for {0}: {1}", shipment.ShipmentNbr, ex.Message);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.CarrierLabel,
-                    "Carrier Label - " + shipment.ShipmentNbr, printerId, PrintJobLogStatus.Error, ex.Message, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.CarrierLabel,
+                    "Carrier Label - " + shipment.ShipmentNbr, printerId, PrintJobLogStatus.Error, ex.Message, null);
                 return "Label printing failed: " + ex.Message;
             }
         }
@@ -432,45 +472,40 @@ namespace StellarOneAutoPrint
         {
             if (shipExt?.UsrConfirmPrinted == true) return null;
             if (string.IsNullOrWhiteSpace(setup.ConfirmReportID)) return null;
+            // Secondary guard on top of the flag above - see AlreadySucceeded's
+            // doc comment for why the flag alone isn't sufficient here.
+            if (PrintJobLogger.AlreadySucceeded(Base, shipment.ShipmentNbr, PrintJobTypes.Confirmation, null)) return null;
 
-            int? printerId = WithIsolatedConnection(() => ResolvePrintNodePrinter(userID, PrintJobTypes.Confirmation))
-                             ?? setup.ConfirmPrinterID;
+            int? printerId = ResolvePrintNodePrinter(userID, PrintJobTypes.Confirmation) ?? setup.ConfirmPrinterID;
             string description = "Shipment Confirmation - " + shipment.ShipmentNbr;
 
             if (!printerId.HasValue)
             {
                 string msg = "No PrintNode printer configured for Confirmation.";
                 PXTrace.WriteWarning("AutoPrint: {0} ({1})", msg, shipment.ShipmentNbr);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
-                    null, PrintJobLogStatus.Error, msg, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
+                    null, PrintJobLogStatus.Error, msg, null);
                 return msg;
             }
 
             try
             {
-                // Stays on the ambient connection - see WithExtendedTimeout's doc comment -
-                // but still needs a longer command timeout than the 30s default to wait out
-                // Confirm Shipment's still-open outer transaction.
-                byte[] pdfBytes = WithExtendedTimeout(() =>
-                    PrintNodeDocumentRenderer.RenderReportToPdfBytes(setup.ConfirmReportID, baseParams, description));
+                byte[] pdfBytes = PrintNodeDocumentRenderer.RenderReportToPdfBytes(setup.ConfirmReportID, baseParams, description);
 
                 long jobId = new PrintNodeApiService(setup.PrintNodeApiKey)
                     .SubmitPrintJob(printerId.Value, pdfBytes, description);
 
-                WithIsolatedConnection(() =>
-                {
-                    MarkPrinted<SOShipmentExt.usrConfirmPrinted>(shipment);
-                    PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
-                        printerId, PrintJobLogStatus.Success, null, jobId,
-                        documentBytes: pdfBytes, documentFileName: description + ".pdf");
-                });
+                MarkPrinted<SOShipmentExt.usrConfirmPrinted>(shipment);
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
+                    printerId, PrintJobLogStatus.Success, null, jobId,
+                    documentBytes: pdfBytes, documentFileName: description + ".pdf");
                 return null;
             }
             catch (Exception ex)
             {
                 PXTrace.WriteError("AutoPrint: Confirmation FAILED for {0}: {1}", shipment.ShipmentNbr, ex.Message);
-                WithIsolatedConnection(() => PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
-                    printerId, PrintJobLogStatus.Error, ex.Message, null));
+                PrintJobLogger.Write(Base, shipment.ShipmentNbr, null, PrintJobTypes.Confirmation, description,
+                    printerId, PrintJobLogStatus.Error, ex.Message, null);
                 return "Confirmation printing failed: " + ex.Message;
             }
         }
@@ -490,11 +525,11 @@ namespace StellarOneAutoPrint
         {
             if (!userID.HasValue) return false;
 
-            var mapping = WithIsolatedConnection(() => SelectFrom<SOStellarPrintNodeUserMap>
+            var mapping = SelectFrom<SOStellarPrintNodeUserMap>
                 .Where<SOStellarPrintNodeUserMap.userID.IsEqual<@P.AsGuid>
                     .And<SOStellarPrintNodeUserMap.isActive.IsEqual<True>>>
                 .View.SelectSingleBound(Base, null, userID.Value)
-                .TopFirst);
+                .TopFirst;
 
             return mapping != null;
         }
@@ -522,11 +557,21 @@ namespace StellarOneAutoPrint
         /// SOStellarPrintNodeSetup is a standalone, keyless singleton table
         /// (see StellarOneAutoPrint_Setup.cs) - a plain PXSelect.Select() with
         /// no Where clause returns the single implicit row, same as how the
-        /// stock SOSetup singleton itself is selected.
+        /// stock SOSetup singleton itself is selected. Uses SelectSingleBound
+        /// for consistency with the other single-row lookups in this file
+        /// (IsUserMigratedToPrintNode, ResolvePrintNodePrinter,
+        /// BuildBaseParameters) - not because it affects reader lifetime.
+        /// Decompiling PX.Data.dll confirmed SelectSingleBound and
+        /// View.Select(...).TopFirst both call the same internal Select(...),
+        /// which fully materializes into a List&lt;object&gt; before returning
+        /// either way, so query shape was never actually relevant to the
+        /// open-reader investigation this comment used to describe. The real
+        /// cause was an undisposed PXDataRecord in RefreshShipmentTstamp -
+        /// see that method's comment for the confirmed root cause and fix.
         /// </summary>
         private SOStellarPrintNodeSetup LoadSetup()
         {
-            return WithIsolatedConnection(() => SelectFrom<SOStellarPrintNodeSetup>.View.Select(Base).TopFirst);
+            return SelectFrom<SOStellarPrintNodeSetup>.View.SelectSingleBound(Base, null).TopFirst;
         }
 
         // =====================================================================
@@ -570,12 +615,10 @@ namespace StellarOneAutoPrint
 
             try
             {
-                // Not wrapped - matches the PrintNode branch's treatment of report
-                // rendering/submission calls; see the RowPersisted handler's comment.
                 QueuePrintJobDeviceHub(setup.UsrGiftNoteReportID, printerID.Value,
                     baseParams, "Gift Note - " + shipment.ShipmentNbr);
 
-                WithIsolatedConnection(() => MarkPrinted<SOShipmentExt.usrGiftNotePrinted>(shipment));
+                MarkPrinted<SOShipmentExt.usrGiftNotePrinted>(shipment);
             }
             catch (Exception ex)
             {
@@ -612,13 +655,22 @@ namespace StellarOneAutoPrint
 
             try
             {
-                var packages = WithIsolatedConnection(() => SelectFrom<SOPackageDetailEx>
+                // See the identical comment in TryPrintLabel (PrintNode
+                // branch) - ToList() here for the same defensive reason
+                // (this SELECT's per-package nested queries share the same
+                // ambient connection, no MultipleActiveResultSets).
+                var packages = SelectFrom<SOPackageDetailEx>
                     .Where<SOPackageDetailEx.shipmentNbr.IsEqual<@P.AsString>>
-                    .View.Select(Base, shipment.ShipmentNbr));
+                    .View.Select(Base, shipment.ShipmentNbr)
+                    .RowCast<SOPackageDetailEx>()
+                    .ToList();
 
                 foreach (SOPackageDetailEx pkg in packages)
                 {
                     if (pkg.NoteID == null) continue;
+
+                    Guid[] fileIDs = PXNoteAttribute.GetFileNotes(Base.Packages.Cache, pkg);
+                    if (fileIDs == null || fileIDs.Length == 0) continue;
 
                     // A package can end up with more than one attached file
                     // whose name starts with "Label" - e.g. one generated at
@@ -633,32 +685,20 @@ namespace StellarOneAutoPrint
                     // order (oldest first), so we take the LAST matching file
                     // in that order, which is the most recently attached one.
                     UploadFileMaintenance uploader = PXGraph.CreateInstance<UploadFileMaintenance>();
-                    Guid[] fileIDs = null;
                     Guid? latestFileID = null;
 
-                    // File lookups are raw DB reads - isolate them, same reason as
-                    // everywhere else in this handler. GetFileNotes (PXNoteAttribute ->
-                    // NoteDoc.SelectMulti) is a BQL query too - it has to be inside this
-                    // isolated scope along with the GetFile lookups below, not run ambient
-                    // before it. See the identical fix/comment in TryPrintLabel above.
-                    WithIsolatedConnection(() =>
+                    foreach (Guid fileID in fileIDs)
                     {
-                        fileIDs = PXNoteAttribute.GetFileNotes(Base.Packages.Cache, pkg);
-                        if (fileIDs == null || fileIDs.Length == 0) return;
+                        PX.SM.FileInfo fileInfo = uploader.GetFile(fileID);
+                        if (fileInfo == null) continue;
 
-                        foreach (Guid fileID in fileIDs)
-                        {
-                            PX.SM.FileInfo fileInfo = uploader.GetFile(fileID);
-                            if (fileInfo == null) continue;
+                        string fileName = fileInfo.Name ?? string.Empty;
+                        if (!fileName.StartsWith("Label", StringComparison.OrdinalIgnoreCase)) continue;
 
-                            string fileName = fileInfo.Name ?? string.Empty;
-                            if (!fileName.StartsWith("Label", StringComparison.OrdinalIgnoreCase)) continue;
-
-                            // Each subsequent match overwrites the previous one,
-                            // so after the loop this holds the last (newest) match.
-                            latestFileID = fileID;
-                        }
-                    });
+                        // Each subsequent match overwrites the previous one,
+                        // so after the loop this holds the last (newest) match.
+                        latestFileID = fileID;
+                    }
 
                     if (!latestFileID.HasValue) continue;
 
@@ -678,8 +718,6 @@ namespace StellarOneAutoPrint
                         DefinePrinterManually = true
                     };
 
-                    // Not wrapped - matches the PrintNode branch's treatment of submission
-                    // calls; see the RowPersisted handler's comment.
                     PXGraph.CreateInstance<SMPrintJobMaint>()
                         .CreatePrintJob(
                             printSettings,
@@ -692,7 +730,7 @@ namespace StellarOneAutoPrint
                 }
 
                 if (anyPrinted)
-                    WithIsolatedConnection(() => MarkPrinted<SOShipmentExt.usrLabelPrinted>(shipment));
+                    MarkPrinted<SOShipmentExt.usrLabelPrinted>(shipment);
             }
             catch (Exception ex)
             {
@@ -716,26 +754,23 @@ namespace StellarOneAutoPrint
         {
             if (!userID.HasValue) return null;
 
-            return WithIsolatedConnection(() =>
-            {
-                // Step 1: find the Carrier Labels NotificationSetup record.
-                var labelSetup = SelectFrom<NotificationSetup>
-                    .Where<NotificationSetup.notificationCD.IsEqual<@P.AsString>>
-                    .View.SelectSingleBound(Base, null, "Carrier Labels")
-                    .TopFirst;
+            // Step 1: find the Carrier Labels NotificationSetup record.
+            var labelSetup = SelectFrom<NotificationSetup>
+                .Where<NotificationSetup.notificationCD.IsEqual<@P.AsString>>
+                .View.SelectSingleBound(Base, null, "Carrier Labels")
+                .TopFirst;
 
-                if (labelSetup?.SetupID == null) return (Guid?)null;
+            if (labelSetup?.SetupID == null) return null;
 
-                // Step 2: find this user's printer override for that mailing.
-                var userOverride = SelectFrom<NotificationSetupUserOverride>
-                    .Where<NotificationSetupUserOverride.userID.IsEqual<@P.AsGuid>
-                        .And<NotificationSetupUserOverride.setupID.IsEqual<@P.AsGuid>>
-                        .And<NotificationSetupUserOverride.active.IsEqual<True>>>
-                    .View.SelectSingleBound(Base, null, userID.Value, labelSetup.SetupID)
-                    .TopFirst;
+            // Step 2: find this user's printer override for that mailing.
+            var userOverride = SelectFrom<NotificationSetupUserOverride>
+                .Where<NotificationSetupUserOverride.userID.IsEqual<@P.AsGuid>
+                    .And<NotificationSetupUserOverride.setupID.IsEqual<@P.AsGuid>>
+                    .And<NotificationSetupUserOverride.active.IsEqual<True>>>
+                .View.SelectSingleBound(Base, null, userID.Value, labelSetup.SetupID)
+                .TopFirst;
 
-                return userOverride?.DefaultPrinterID;
-            });
+            return userOverride?.DefaultPrinterID;
         }
 
         private void TryPrintConfirmationDeviceHub(
@@ -756,12 +791,10 @@ namespace StellarOneAutoPrint
 
             try
             {
-                // Not wrapped - matches the PrintNode branch's treatment of submission
-                // calls; see the RowPersisted handler's comment.
                 QueuePrintJobDeviceHub(setup.UsrConfirmReportID, printerID.Value,
                     baseParams, "Shipment Confirmation - " + shipment.ShipmentNbr);
 
-                WithIsolatedConnection(() => MarkPrinted<SOShipmentExt.usrConfirmPrinted>(shipment));
+                MarkPrinted<SOShipmentExt.usrConfirmPrinted>(shipment);
             }
             catch (Exception ex)
             {
@@ -792,35 +825,29 @@ namespace StellarOneAutoPrint
             if (!userID.HasValue || string.IsNullOrWhiteSpace(reportID))
                 return null;
 
-            return WithIsolatedConnection(() =>
-            {
-                // Step 1: find the NotificationSetup record for this report ID.
-                var setup = SelectFrom<NotificationSetup>
-                    .Where<NotificationSetup.reportID.IsEqual<@P.AsString>>
-                    .View.SelectSingleBound(Base, null, reportID)
-                    .TopFirst;
+            // Step 1: find the NotificationSetup record for this report ID.
+            var setup = SelectFrom<NotificationSetup>
+                .Where<NotificationSetup.reportID.IsEqual<@P.AsString>>
+                .View.SelectSingleBound(Base, null, reportID)
+                .TopFirst;
 
-                if (setup?.SetupID == null) return (Guid?)null;
+            if (setup?.SetupID == null) return null;
 
-                // Step 2: find the user's override for that mailing/setup.
-                var userOverride = SelectFrom<NotificationSetupUserOverride>
-                    .Where<NotificationSetupUserOverride.userID.IsEqual<@P.AsGuid>
-                        .And<NotificationSetupUserOverride.setupID.IsEqual<@P.AsGuid>>>
-                    .View.SelectSingleBound(Base, null, userID.Value, setup.SetupID)
-                    .TopFirst;
+            // Step 2: find the user's override for that mailing/setup.
+            var userOverride = SelectFrom<NotificationSetupUserOverride>
+                .Where<NotificationSetupUserOverride.userID.IsEqual<@P.AsGuid>
+                    .And<NotificationSetupUserOverride.setupID.IsEqual<@P.AsGuid>>>
+                .View.SelectSingleBound(Base, null, userID.Value, setup.SetupID)
+                .TopFirst;
 
-                return userOverride?.DefaultPrinterID;
-            });
+            return userOverride?.DefaultPrinterID;
         }
 
         private SOSetupExt LoadSetupExt()
         {
-            return WithIsolatedConnection(() =>
-            {
-                var setup = PXSelect<SOSetup>.Select(Base);
-                if (setup == null) return null;
-                return PXCache<SOSetup>.GetExtension<SOSetupExt>((SOSetup)setup);
-            });
+            var setup = PXSelect<SOSetup>.Select(Base);
+            if (setup == null) return null;
+            return PXCache<SOSetup>.GetExtension<SOSetupExt>((SOSetup)setup);
         }
 
         private void QueuePrintJobDeviceHub(
@@ -871,10 +898,10 @@ namespace StellarOneAutoPrint
         {
             var p = new Dictionary<string, string> { { "ShipmentNbr", shipment.ShipmentNbr } };
 
-            var os = WithIsolatedConnection(() => SelectFrom<SOOrderShipment>
+            var os = SelectFrom<SOOrderShipment>
                 .Where<SOOrderShipment.shipmentNbr.IsEqual<@P.AsString>>
                 .View.SelectSingleBound(Base, null, shipment.ShipmentNbr)
-                .TopFirst);
+                .TopFirst;
 
             if (os != null)
             {
@@ -929,10 +956,13 @@ namespace StellarOneAutoPrint
         /// cached, it can hand back the identity-mapped cached object itself
         /// instead of a true re-read, making the refresh a no-op. PXDatabase
         /// bypasses PXCache entirely (raw ADO read), which is what actually
-        /// guarantees a fresh value from the DB. SetPrintedFlag's follow-up
-        /// SetStatus(Notchanged) call is the real backstop, though - this
-        /// keeps the cached tstamp correct for the (rare) case something
-        /// re-dirties the row again before the next full reselect.
+        /// guarantees a fresh value from the DB - and it runs on the plain
+        /// ambient connection like everything else in this handler, so it
+        /// can't self-deadlock against the still-open outer transaction the
+        /// way an isolated second connection would. SetPrintedFlag's
+        /// follow-up SetStatus(Notchanged) call is the real backstop, though
+        /// - this keeps the cached tstamp correct for the (rare) case
+        /// something re-dirties the row again before the next full reselect.
         /// </summary>
         private void RefreshShipmentTstamp(SOShipment shipment)
         {
@@ -946,16 +976,30 @@ namespace StellarOneAutoPrint
             // PXDataFieldParam (the family used by PXDatabase.Update's
             // restrict/assign pairs), not PXDataField, so it isn't a legal
             // element of SelectSingle's PXDataField[] params array.
-            PXDataRecord rec = PXDatabase.SelectSingle<SOShipment>(
+            //
+            // PXDataRecord wraps a live IDataReader/IDbCommand directly (unlike
+            // SelectFrom<T>.View.Select/SelectSingleBound, which materialize
+            // into a disconnected List<object> before returning) - confirmed
+            // by decompiling PX.Data.dll: PXDataRecord : IDisposable, and
+            // PXDatabase's own internal call sites wrap it in a using block.
+            // This one didn't, which leaked an open reader on the ambient
+            // connection on every single successful MarkPrinted<T> call -
+            // confirmed live as the actual root cause of the "There is
+            // already an open DataReader" collisions chased throughout this
+            // whole investigation (see StellarOneAutoPrint_PrintJobLog.cs's
+            // PrintJobLogger.Write for the ruled-out alternative theory).
+            using (PXDataRecord rec = PXDatabase.SelectSingle<SOShipment>(
                 new PXDataField<SOShipment.Tstamp>(),
-                new PXDataFieldValue<SOShipment.shipmentNbr>(shipment.ShipmentNbr));
-
-            // GetTimeStamp (not GetByteArray, which doesn't exist on
-            // PXDataRecord) is the rowversion-specific accessor and returns
-            // null for a DBNull column, same as the other Get* accessors.
-            byte[] freshTstamp = rec?.GetTimeStamp(0);
-            if (freshTstamp != null)
-                shipment.tstamp = freshTstamp;
+                new PXDataFieldValue<SOShipment.shipmentNbr>(shipment.ShipmentNbr)))
+            {
+                // GetTimeStamp (not GetByteArray, which doesn't exist on
+                // PXDataRecord) is the rowversion-specific accessor and
+                // returns null for a DBNull column, same as the other Get*
+                // accessors.
+                byte[] freshTstamp = rec?.GetTimeStamp(0);
+                if (freshTstamp != null)
+                    shipment.tstamp = freshTstamp;
+            }
         }
     }
 }

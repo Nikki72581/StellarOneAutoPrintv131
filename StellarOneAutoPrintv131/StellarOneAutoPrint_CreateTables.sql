@@ -73,6 +73,33 @@ BEGIN
 END
 GO
 
+-- CarrierLabelPdfRotation / CarrierLabelFitToPage added 2026-09-13 for
+-- PrintNode's per-job options.rotate/options.fit_to_page (PDF-only carrier
+-- label attachments, e.g. international customs forms, printing tiny/
+-- misoriented on label stock at native scale - see the DAC field comments
+-- in StellarOneAutoPrint_Setup.cs). Same guarded-ALTER pattern as
+-- ComputerName/NoteID below, since the table above may already exist
+-- without them. [PXDBInt]/[PXDBBool] + PersistingCheck=Nothing produces a
+-- nullable column with no DB-level default, matching
+-- EnhancedPrintingEnabled's existing shape.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.SOStellarPrintNodeSetup') AND name = 'CarrierLabelPdfRotation'
+)
+BEGIN
+    ALTER TABLE dbo.SOStellarPrintNodeSetup ADD CarrierLabelPdfRotation int NULL;
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.SOStellarPrintNodeSetup') AND name = 'CarrierLabelFitToPage'
+)
+BEGIN
+    ALTER TABLE dbo.SOStellarPrintNodeSetup ADD CarrierLabelFitToPage bit NULL;
+END
+GO
+
 -- ----------------------------------------------------------------------------
 -- SOStellarPrintNodePrinter - synced PrintNode printer list (StellarOneAutoPrint_PrintNode_Transport.cs)
 -- ----------------------------------------------------------------------------
